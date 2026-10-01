@@ -61,6 +61,7 @@ type Upstream struct {
 	activeHealthCheckUpstream string
 	healthCheckPolicy         *PassiveHealthChecks
 	cb                        CircuitBreaker
+	adaptive                  *adaptiveHostState
 
 	// state from the active health checker. It lives here rather than on
 	// the shared Host because the Host is keyed by dial address alone,
@@ -182,8 +183,31 @@ func (u *Upstream) fillDynamicHost() {
 // Host is the basic, in-memory representation of the state of a remote host.
 // Its fields are accessed atomically and Host values must not be copied.
 type Host struct {
-	numRequests atomic.Int64
-	fails       atomic.Int64
+	numRequests    atomic.Int64
+	fails          atomic.Int64
+	adaptiveMu     sync.Mutex
+	adaptiveStates map[*AdaptiveConcurrency]*adaptiveHostState
+}
+
+func (h *Host) adaptiveState(config *AdaptiveConcurrency) *adaptiveHostState {
+	h.adaptiveMu.Lock()
+	defer h.adaptiveMu.Unlock()
+
+	if h.adaptiveStates == nil {
+		h.adaptiveStates = make(map[*AdaptiveConcurrency]*adaptiveHostState)
+	}
+	if state := h.adaptiveStates[config]; state != nil {
+		return state
+	}
+	state := newAdaptiveHostState(config.WindowSize)
+	h.adaptiveStates[config] = state
+	return state
+}
+
+func (h *Host) clearAdaptiveState(config *AdaptiveConcurrency) {
+	h.adaptiveMu.Lock()
+	delete(h.adaptiveStates, config)
+	h.adaptiveMu.Unlock()
 }
 
 // NumRequests returns the number of active requests to the upstream.

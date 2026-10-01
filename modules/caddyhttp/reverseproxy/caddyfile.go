@@ -64,6 +64,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //
 //	    # load balancing
 //	    lb_policy <name> [<options...>]
+//	    lb_adaptive [<window_size>]
 //	    lb_retries <retries>
 //	    lb_try_duration <duration>
 //	    lb_try_interval <interval>
@@ -283,6 +284,29 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.LoadBalancing = new(LoadBalancing)
 			}
 			h.LoadBalancing.SelectionPolicyRaw = caddyconfig.JSONModuleObject(sel, "policy", name, nil)
+
+		case "lb_adaptive":
+			if h.LoadBalancing != nil && h.LoadBalancing.AdaptiveConcurrency != nil {
+				return d.Err("adaptive concurrency already configured")
+			}
+			adaptive := &AdaptiveConcurrency{}
+			if d.NextArg() {
+				windowSize, err := strconv.Atoi(d.Val())
+				if err != nil {
+					return d.Errf("invalid RTT window size '%s': %v", d.Val(), err)
+				}
+				adaptive.WindowSize = windowSize
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+			}
+			if err := adaptive.provision(); err != nil {
+				return d.Err(err.Error())
+			}
+			if h.LoadBalancing == nil {
+				h.LoadBalancing = new(LoadBalancing)
+			}
+			h.LoadBalancing.AdaptiveConcurrency = adaptive
 
 		case "lb_retries":
 			if !d.NextArg() {

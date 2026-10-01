@@ -283,9 +283,15 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 		// This means we can safely use the address in dialInfo if proxy is not used (the address and network will be same any way)
 		// or if the upstream is unix (because there is no way socks or http proxy can be used for unix address).
 		if dialInfo, ok := GetDialInfo(ctx); ok {
-			if caddyhttp.GetVar(ctx, proxyVarKey) == nil || strings.HasPrefix(dialInfo.Network, "unix") {
+			proxyConfigured := caddyhttp.GetVar(ctx, proxyVarKey) != nil
+			if !proxyConfigured || strings.HasPrefix(dialInfo.Network, "unix") {
 				network = dialInfo.Network
 				address = dialInfo.Address
+			}
+			if dialInfo.Upstream != nil && dialInfo.Upstream.adaptive != nil {
+				if proxyConfigured || !strings.HasPrefix(network, "tcp") {
+					return nil, errAdaptiveTCPUnsupported
+				}
 			}
 		}
 
@@ -533,8 +539,6 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 
 	// if h2/c is enabled, configure it explicitly
 	if slices.Contains(h.Versions, "2") || slices.Contains(h.Versions, "h2c") {
-		// TODO: Migrate to http.Transport.Protocols once transport behaviour is covered.
-		//nolint:staticcheck
 		if err := http2.ConfigureTransport(rt); err != nil {
 			return nil, err
 		}

@@ -14,9 +14,11 @@ import (
 )
 
 var reverseProxyMetrics = struct {
-	once             sync.Once
-	upstreamsHealthy *prometheus.GaugeVec
-	logger           *zap.Logger
+	once                        sync.Once
+	upstreamsHealthy            *prometheus.GaugeVec
+	adaptiveActiveConnections  *prometheus.GaugeVec
+	adaptiveMaxConnections     *prometheus.GaugeVec
+	logger                      *zap.Logger
 }{}
 
 func initReverseProxyMetrics(handler *Handler, registry *prometheus.Registry) {
@@ -30,6 +32,18 @@ func initReverseProxyMetrics(handler *Handler, registry *prometheus.Registry) {
 			Name:      "upstreams_healthy",
 			Help:      "Health status of reverse proxy upstreams.",
 		}, upstreamsLabels)
+		reverseProxyMetrics.adaptiveActiveConnections = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "adaptive_active_connections",
+			Help:      "Number of active HTTP/1.1 requests occupying adaptive connection slots; excludes idle keep-alive connections.",
+		}, upstreamsLabels)
+		reverseProxyMetrics.adaptiveMaxConnections = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "adaptive_max_connections",
+			Help:      "Adaptive maximum number of concurrent HTTP/1.1 upstream connections.",
+		}, upstreamsLabels)
 	})
 
 	// duplicate registration could happen if multiple sites with reverse proxy are configured; so ignore the error because
@@ -39,6 +53,20 @@ func initReverseProxyMetrics(handler *Handler, registry *prometheus.Registry) {
 		!errors.Is(err, prometheus.AlreadyRegisteredError{
 			ExistingCollector: reverseProxyMetrics.upstreamsHealthy,
 			NewCollector:      reverseProxyMetrics.upstreamsHealthy,
+		}) {
+		panic(err)
+	}
+	if err := registry.Register(reverseProxyMetrics.adaptiveActiveConnections); err != nil &&
+		!errors.Is(err, prometheus.AlreadyRegisteredError{
+			ExistingCollector: reverseProxyMetrics.adaptiveActiveConnections,
+			NewCollector:      reverseProxyMetrics.adaptiveActiveConnections,
+		}) {
+		panic(err)
+	}
+	if err := registry.Register(reverseProxyMetrics.adaptiveMaxConnections); err != nil &&
+		!errors.Is(err, prometheus.AlreadyRegisteredError{
+			ExistingCollector: reverseProxyMetrics.adaptiveMaxConnections,
+			NewCollector:      reverseProxyMetrics.adaptiveMaxConnections,
 		}) {
 		panic(err)
 	}
@@ -53,6 +81,8 @@ type metricsUpstreamsHealthyUpdater struct {
 func newMetricsUpstreamsHealthyUpdater(handler *Handler, ctx caddy.Context) *metricsUpstreamsHealthyUpdater {
 	initReverseProxyMetrics(handler, ctx.GetMetricsRegistry())
 	reverseProxyMetrics.upstreamsHealthy.Reset()
+	reverseProxyMetrics.adaptiveActiveConnections.Reset()
+	reverseProxyMetrics.adaptiveMaxConnections.Reset()
 
 	return &metricsUpstreamsHealthyUpdater{handler}
 }
@@ -71,14 +101,19 @@ func (m *metricsUpstreamsHealthyUpdater) init() {
 		}()
 
 		m.update()
+		m.updateAdaptiveConcurrency()
 
 		ticker := time.NewTicker(10 * time.Second)
+		adaptiveTicker := time.NewTicker(time.Second)
 		for {
 			select {
 			case <-ticker.C:
 				m.update()
+			case <-adaptiveTicker.C:
+				m.updateAdaptiveConcurrency()
 			case <-m.handler.ctx.Done():
 				ticker.Stop()
+				adaptiveTicker.Stop()
 				return
 			}
 		}
@@ -96,4 +131,24 @@ func (m *metricsUpstreamsHealthyUpdater) update() {
 
 		reverseProxyMetrics.upstreamsHealthy.With(labels).Set(gaugeValue)
 	}
+}
+
+func (m *metricsUpstreamsHealthyUpdater) updateAdaptiveConcurrency() {
+	for _, upstream := range m.handler.Upstreams {
+		if upstream.adaptive == nil {
+			continue
+		}
+		_, max := upstream.adaptive.snapshot()
+		labels := prometheus.Labels{"upstream": upstream.Dial}
+		reverseProxyMetrics.adaptiveActiveConnections.With(labels)
+		reverseProxyMetrics.adaptiveMaxConnections.With(labels).Set(float64(max))
+	}
+}
+
+func incAdaptiveActiveConnections(upstream string) {
+	reverseProxyMetrics.adaptiveActiveConnections.WithLabelValues(upstream).Inc()
+}
+
+func decAdaptiveActiveConnections(upstream string) {
+	reverseProxyMetrics.adaptiveActiveConnections.WithLabelValues(upstream).Dec()
 }

@@ -89,6 +89,7 @@ func init() {
 // `{http.reverse_proxy.upstream.port}` | The port of the upstream
 // `{http.reverse_proxy.upstream.requests}` | The approximate current number of requests to the upstream
 // `{http.reverse_proxy.upstream.max_requests}` | The maximum approximate number of requests allowed to the upstream
+// `{http.reverse_proxy.upstream.max_connections}` | The adaptive maximum number of TCP connections to the upstream, or 0 if adaptive limiting is disabled.
 // `{http.reverse_proxy.upstream.fails}` | The number of recent failed requests to the upstream
 // `{http.reverse_proxy.upstream.latency}` | How long it took the proxy upstream to write the response header.
 // `{http.reverse_proxy.upstream.latency_ms}` | Same as 'latency', but in milliseconds.
@@ -354,6 +355,9 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	// set up transport
 	if h.Transport == nil {
 		t := &HTTPTransport{}
+		if h.LoadBalancing != nil && h.LoadBalancing.AdaptiveConcurrency != nil {
+			t.Versions = []string{"1.1"}
+		}
 		err := t.Provision(ctx)
 		if err != nil {
 			return fmt.Errorf("provisioning default transport: %v", err)
@@ -376,6 +380,27 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	// set up load balancing
 	if h.LoadBalancing == nil {
 		h.LoadBalancing = new(LoadBalancing)
+	}
+	if h.LoadBalancing.AdaptiveConcurrency != nil {
+		if err := h.LoadBalancing.AdaptiveConcurrency.provision(); err != nil {
+			return fmt.Errorf("provisioning adaptive concurrency: %w", err)
+		}
+		httpTransport, ok := h.Transport.(*HTTPTransport)
+		if !ok {
+			return fmt.Errorf("adaptive TCP connection limits require the HTTP transport")
+		}
+		if httpTransport.h3Transport != nil {
+			return fmt.Errorf("adaptive TCP connection limits cannot be used with HTTP/3")
+		}
+		if len(httpTransport.Versions) != 1 || httpTransport.Versions[0] != "1.1" {
+			return fmt.Errorf("adaptive TCP connection limits require HTTP/1.1 only; configure transport versions 1.1")
+		}
+		if httpTransport.ForwardProxyURL != "" || len(httpTransport.NetworkProxyRaw) > 0 {
+			return fmt.Errorf("adaptive TCP connection limits cannot be used with a network proxy")
+		}
+		if httpTransport.Transport.MaxConnsPerHost != 0 {
+			return fmt.Errorf("adaptive TCP connection limits cannot be combined with max_conns_per_host")
+		}
 	}
 	if h.LoadBalancing.SelectionPolicy == nil {
 		h.LoadBalancing.SelectionPolicy = RandomSelection{}
@@ -440,6 +465,19 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 // Cleanup cleans up the resources made by h.
 func (h *Handler) Cleanup() error {
 	err := h.cleanupConnections()
+	if h.LoadBalancing != nil && h.LoadBalancing.AdaptiveConcurrency != nil {
+		config := h.LoadBalancing.AdaptiveConcurrency
+		for _, upstream := range h.Upstreams {
+			if upstream.Host != nil {
+				upstream.Host.clearAdaptiveState(config)
+			}
+		}
+		dynamicHostsMu.Lock()
+		for _, entry := range dynamicHosts {
+			entry.host.clearAdaptiveState(config)
+		}
+		dynamicHostsMu.Unlock()
+	}
 
 	// remove hosts from our config from the pool
 	for _, upstream := range h.Upstreams {
@@ -667,6 +705,7 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 	repl.Set("http.reverse_proxy.upstream.port", dialInfo.Port)
 	repl.Set("http.reverse_proxy.upstream.requests", upstream.Host.NumRequests())
 	repl.Set("http.reverse_proxy.upstream.max_requests", upstream.MaxRequests)
+	repl.Set("http.reverse_proxy.upstream.max_connections", upstream.maxTCPConnections())
 	repl.Set("http.reverse_proxy.upstream.fails", upstream.Host.Fails())
 
 	// mutate request headers according to this upstream;
@@ -701,6 +740,12 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 	proxyErr = h.reverseProxy(w, r, origReq, repl, dialInfo, next)
 	if proxyErr == nil {
 		return true, nil
+	}
+	if errors.Is(proxyErr, errAdaptiveRequestQueueFull) {
+		return true, caddyhttp.Error(http.StatusServiceUnavailable, errNoUpstream)
+	}
+	if errors.Is(proxyErr, errAdaptiveTCPUnsupported) {
+		return true, caddyhttp.Error(http.StatusInternalServerError, proxyErr)
 	}
 	if errors.Is(proxyErr, context.Canceled) {
 		// context.Canceled happens when the downstream client cancels the
@@ -993,6 +1038,22 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 // (This method is mostly the beginning of what was borrowed from the net/http/httputil package in the
 // Go standard library which was used as the foundation.)
 func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origReq *http.Request, repl *caddy.Replacer, di DialInfo, next caddyhttp.Handler) error {
+	var releaseAdaptive func()
+	if di.Upstream.adaptive != nil {
+		var err error
+		releaseAdaptive, err = di.Upstream.adaptive.acquireRequest(req.Context(), maxAdaptiveRequestQueue, adaptiveRequestWaitTime)
+		if err != nil {
+			return err
+		}
+	}
+	if releaseAdaptive != nil {
+		incAdaptiveActiveConnections(di.Upstream.Dial)
+		defer func() {
+			releaseAdaptive()
+			decAdaptiveActiveConnections(di.Upstream.Dial)
+		}()
+	}
+
 	_ = di.Upstream.Host.countRequest(1)
 
 	// Increment the in-flight request count
@@ -1074,6 +1135,7 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 		}
 		return err
 	}
+	di.Upstream.recordRTT(duration)
 	if c := logger.Check(zapcore.DebugLevel, logMessage); c != nil {
 		c.Write(
 			zap.Object("headers", caddyhttp.LoggableHTTPHeader{
@@ -1461,6 +1523,9 @@ func (h Handler) provisionUpstream(upstream *Upstream, dynamic bool) {
 	} else {
 		upstream.fillHost()
 	}
+	if h.LoadBalancing != nil && h.LoadBalancing.AdaptiveConcurrency != nil {
+		upstream.adaptive = upstream.Host.adaptiveState(h.LoadBalancing.AdaptiveConcurrency)
+	}
 
 	// give it the circuit breaker, if any
 	upstream.cb = h.CB
@@ -1654,6 +1719,10 @@ func statusError(err error) error {
 
 // LoadBalancing has parameters related to load balancing.
 type LoadBalancing struct {
+	// AdaptiveConcurrency adjusts each upstream's concurrent request limit
+	// using its observed round-trip times.
+	AdaptiveConcurrency *AdaptiveConcurrency `json:"adaptive_concurrency,omitempty"`
+
 	// A selection policy is how to choose an available backend.
 	// The default policy is random selection.
 	SelectionPolicyRaw json.RawMessage `json:"selection_policy,omitempty" caddy:"namespace=http.reverse_proxy.selection_policies inline_key=policy"`
@@ -1752,6 +1821,8 @@ var hopHeaders = []string{
 // DialError is an error that specifically occurs
 // in a call to Dial or DialContext.
 type DialError struct{ error }
+
+func (e DialError) Unwrap() error { return e.error }
 
 // TLSTransport is implemented by transports
 // that are capable of using TLS.
