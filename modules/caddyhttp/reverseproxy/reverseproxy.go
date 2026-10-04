@@ -111,6 +111,16 @@ type Handler struct {
 	// Load balancing distributes load/requests between backends.
 	LoadBalancing *LoadBalancing `json:"load_balancing,omitempty"`
 
+	// AdaptiveMaxConn enables adaptive concurrency with this initial limit.
+	AdaptiveMaxConn int `json:"adaptive_max_conn,omitempty"`
+
+	// AdaptiveMaxConnCeiling caps how far adaptive concurrency may climb.
+	// Zero selects adaptiveDefaultCeiling.
+	AdaptiveMaxConnCeiling int `json:"adaptive_max_conn_ceiling,omitempty"`
+
+	// AdaptiveInterval sets how often adaptive concurrency is evaluated.
+	AdaptiveInterval caddy.Duration `json:"adaptive_interval,omitempty"`
+
 	// Health checks update the status of backends, whether they are
 	// up or down. Down backends will not be proxied to.
 	HealthChecks *HealthChecks `json:"health_checks,omitempty"`
@@ -244,6 +254,7 @@ type Handler struct {
 	connections           map[io.ReadWriteCloser]openConnection
 	connectionsCloseTimer *time.Timer
 	connectionsMu         *sync.Mutex
+	adaptive              *adaptiveController
 
 	ctx    caddy.Context
 	logger *zap.Logger
@@ -260,6 +271,16 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 
 // Provision ensures that h is set up properly before use.
 func (h *Handler) Provision(ctx caddy.Context) error {
+	if h.AdaptiveMaxConn < 0 {
+		return fmt.Errorf("adaptive max_conn cannot be negative")
+	}
+	if h.AdaptiveMaxConnCeiling < 0 {
+		return fmt.Errorf("adaptive max_conn ceiling cannot be negative")
+	}
+	if h.AdaptiveInterval < 0 {
+		return fmt.Errorf("adaptive interval cannot be negative")
+	}
+
 	eventAppIface, err := ctx.App("events")
 	if err != nil {
 		return fmt.Errorf("getting events app: %v", err)
@@ -433,6 +454,12 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 	upstreamHealthyUpdater := newMetricsUpstreamsHealthyUpdater(h, ctx)
 	upstreamHealthyUpdater.init()
+	if h.AdaptiveMaxConn > 0 {
+		interval := adaptiveInterval(time.Duration(h.AdaptiveInterval))
+		h.adaptive = newAdaptiveController(h, interval)
+		h.adaptive.publish()
+		go h.adaptive.run(h.ctx.Done())
+	}
 
 	return nil
 }
@@ -483,6 +510,18 @@ func (b *bodyNopCloserIfNotRead) Close() error {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if h.adaptive != nil {
+		arrival := time.Now()
+		if !h.adaptive.acquire(r.Context()) {
+			h.adaptive.recordResponse(time.Since(arrival))
+			return caddyhttp.Error(http.StatusServiceUnavailable, r.Context().Err())
+		}
+		defer func() {
+			h.adaptive.recordResponse(time.Since(arrival))
+			h.adaptive.release()
+		}()
+	}
+
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	// prepare the request for proxying; this is needed only once

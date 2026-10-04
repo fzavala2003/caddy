@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -726,6 +727,58 @@ func TestRetryMatchAllowsExpressionMixedWithOtherMatchers(t *testing.T) {
 			err := h.UnmarshalCaddyfile(d)
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestAdaptiveMaxConnUnmarshalCaddyfile(t *testing.T) {
+	tests := []struct {
+		name         string
+		input        string
+		wantMaxConn  int
+		wantInterval caddy.Duration
+		wantErr      bool
+	}{
+		{
+			name:         "default interval",
+			input:        "reverse_proxy localhost:9080 {\n adaptive_max_conn 20\n}",
+			wantMaxConn:  20,
+			wantInterval: caddy.Duration(time.Second),
+		},
+		{
+			name:         "configured interval",
+			input:        "reverse_proxy localhost:9080 {\n adaptive_max_conn 20 2s\n}",
+			wantMaxConn:  20,
+			wantInterval: caddy.Duration(2 * time.Second),
+		},
+		{
+			name:    "zero max conn",
+			input:   "reverse_proxy localhost:9080 {\n adaptive_max_conn 0\n}",
+			wantErr: true,
+		},
+		{
+			name:    "zero interval",
+			input:   "reverse_proxy localhost:9080 {\n adaptive_max_conn 20 0s\n}",
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := new(Handler)
+			err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(tc.input))
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("UnmarshalCaddyfile() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if h.AdaptiveMaxConn != tc.wantMaxConn {
+				t.Errorf("AdaptiveMaxConn = %d, want %d", h.AdaptiveMaxConn, tc.wantMaxConn)
+			}
+			if h.AdaptiveInterval != tc.wantInterval {
+				t.Errorf("AdaptiveInterval = %s, want %s", time.Duration(h.AdaptiveInterval), time.Duration(tc.wantInterval))
 			}
 		})
 	}

@@ -68,6 +68,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    lb_try_duration <duration>
 //	    lb_try_interval <interval>
 //	    lb_retry_match <matcher>
+//	    adaptive_max_conn <initial> [<interval>] [<ceiling>]
 //
 //	    # active health checking
 //	    health_uri          <uri>
@@ -322,6 +323,37 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Errf("bad interval value '%s': %v", d.Val(), err)
 			}
 			h.LoadBalancing.TryInterval = caddy.Duration(dur)
+
+		case "adaptive_max_conn":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			initial, err := strconv.Atoi(d.Val())
+			if err != nil || initial <= 0 {
+				return d.Errf("adaptive max_conn must be a positive integer")
+			}
+			if h.AdaptiveMaxConn != 0 {
+				return d.Err("adaptive_max_conn may only be configured once")
+			}
+			h.AdaptiveMaxConn = initial
+			h.AdaptiveInterval = caddy.Duration(adaptiveInterval(0))
+			if d.NextArg() {
+				interval, err := caddy.ParseDuration(d.Val())
+				if err != nil || interval <= 0 {
+					return d.Errf("adaptive interval must be a positive duration")
+				}
+				h.AdaptiveInterval = caddy.Duration(interval)
+				if d.NextArg() {
+					ceiling, err := strconv.Atoi(d.Val())
+					if err != nil || ceiling <= 0 {
+						return d.Errf("adaptive max_conn ceiling must be a positive integer")
+					}
+					h.AdaptiveMaxConnCeiling = ceiling
+					if d.NextArg() {
+						return d.ArgErr()
+					}
+				}
+			}
 
 		case "lb_retry_match":
 			matcherSet, err := caddyhttp.ParseCaddyfileNestedMatcherSet(d)

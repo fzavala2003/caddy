@@ -14,9 +14,11 @@ import (
 )
 
 var reverseProxyMetrics = struct {
-	once             sync.Once
-	upstreamsHealthy *prometheus.GaugeVec
-	logger           *zap.Logger
+	once                      sync.Once
+	upstreamsHealthy          *prometheus.GaugeVec
+	adaptiveMaxConnections    *prometheus.GaugeVec
+	adaptiveActiveConnections *prometheus.GaugeVec
+	logger                    *zap.Logger
 }{}
 
 func initReverseProxyMetrics(handler *Handler, registry *prometheus.Registry) {
@@ -30,17 +32,34 @@ func initReverseProxyMetrics(handler *Handler, registry *prometheus.Registry) {
 			Name:      "upstreams_healthy",
 			Help:      "Health status of reverse proxy upstreams.",
 		}, upstreamsLabels)
+		reverseProxyMetrics.adaptiveMaxConnections = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "adaptive_max_connections",
+			Help:      "Current adaptive maximum number of concurrent reverse proxy requests.",
+		}, upstreamsLabels)
+		reverseProxyMetrics.adaptiveActiveConnections = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "adaptive_active_connections",
+			Help:      "Current number of active adaptive reverse proxy requests.",
+		}, upstreamsLabels)
 	})
 
 	// duplicate registration could happen if multiple sites with reverse proxy are configured; so ignore the error because
 	// there's no good way to capture having multiple sites with reverse proxy. If this happens, the metrics will be
 	// registered twice, but the second registration will be ignored.
-	if err := registry.Register(reverseProxyMetrics.upstreamsHealthy); err != nil &&
-		!errors.Is(err, prometheus.AlreadyRegisteredError{
-			ExistingCollector: reverseProxyMetrics.upstreamsHealthy,
-			NewCollector:      reverseProxyMetrics.upstreamsHealthy,
+	for _, collector := range []prometheus.Collector{
+		reverseProxyMetrics.upstreamsHealthy,
+		reverseProxyMetrics.adaptiveMaxConnections,
+		reverseProxyMetrics.adaptiveActiveConnections,
+	} {
+		if err := registry.Register(collector); err != nil && !errors.Is(err, prometheus.AlreadyRegisteredError{
+			ExistingCollector: collector,
+			NewCollector:      collector,
 		}) {
-		panic(err)
+			panic(err)
+		}
 	}
 
 	reverseProxyMetrics.logger = handler.logger.Named("reverse_proxy.metrics")
