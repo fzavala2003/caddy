@@ -18,6 +18,9 @@ var reverseProxyMetrics = struct {
 	upstreamsHealthy          *prometheus.GaugeVec
 	adaptiveMaxConnections    *prometheus.GaugeVec
 	adaptiveActiveConnections *prometheus.GaugeVec
+	adaptiveObservedRPS       *prometheus.GaugeVec
+	adaptiveAverageRTT        *prometheus.GaugeVec
+	adaptiveRPSStop           *prometheus.GaugeVec
 	logger                    *zap.Logger
 }{}
 
@@ -44,6 +47,24 @@ func initReverseProxyMetrics(handler *Handler, registry *prometheus.Registry) {
 			Name:      "adaptive_active_connections",
 			Help:      "Current number of active adaptive reverse proxy requests.",
 		}, upstreamsLabels)
+		reverseProxyMetrics.adaptiveObservedRPS = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "adaptive_observed_rps",
+			Help:      "Requests per second admitted by the adaptive limiter, as measured by the controller itself.",
+		}, upstreamsLabels)
+		reverseProxyMetrics.adaptiveAverageRTT = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "adaptive_average_rtt_seconds",
+			Help:      "Average time requests spend after admission, measured by the controller itself.",
+		}, upstreamsLabels)
+		reverseProxyMetrics.adaptiveRPSStop = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns,
+			Subsystem: sub,
+			Name:      "adaptive_rps_stop",
+			Help:      "Throughput reference the controller must beat to keep increasing concurrency.",
+		}, upstreamsLabels)
 	})
 
 	// duplicate registration could happen if multiple sites with reverse proxy are configured; so ignore the error because
@@ -53,6 +74,9 @@ func initReverseProxyMetrics(handler *Handler, registry *prometheus.Registry) {
 		reverseProxyMetrics.upstreamsHealthy,
 		reverseProxyMetrics.adaptiveMaxConnections,
 		reverseProxyMetrics.adaptiveActiveConnections,
+		reverseProxyMetrics.adaptiveObservedRPS,
+		reverseProxyMetrics.adaptiveAverageRTT,
+		reverseProxyMetrics.adaptiveRPSStop,
 	} {
 		if err := registry.Register(collector); err != nil && !errors.Is(err, prometheus.AlreadyRegisteredError{
 			ExistingCollector: collector,

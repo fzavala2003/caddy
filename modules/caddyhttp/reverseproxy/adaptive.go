@@ -136,25 +136,31 @@ func (c *adaptiveController) run(done <-chan struct{}) {
 	}
 }
 
-func (c *adaptiveController) acquire(ctx context.Context) bool {
+// acquire reserva un slot de concurrencia y devuelve el instante en que
+// fue admitido. El RTT se mide desde ese instante y no desde la llegada:
+// si se midiera desde la llegada, la espera acumulada en la propia cola
+// del limiter se sumaria como latencia del upstream, y Little's Law
+// devolveria una concurrencia que ningun limiter permitiria.
+func (c *adaptiveController) acquire(ctx context.Context) (time.Time, bool) {
 	for {
 		if ctx.Err() != nil {
-			return false
+			return time.Time{}, false
 		}
 
 		c.mu.Lock()
 		if c.activeConn < c.maxConn {
 			c.activeConn++
+			admitted := time.Now()
 			c.publishLocked()
 			c.mu.Unlock()
-			return true
+			return admitted, true
 		}
 		changed := c.changed
 		c.mu.Unlock()
 
 		select {
 		case <-ctx.Done():
-			return false
+			return time.Time{}, false
 		case <-changed:
 		}
 	}
@@ -176,6 +182,26 @@ func (c *adaptiveController) release() {
 	c.publishLocked()
 	c.notifyLocked()
 	c.mu.Unlock()
+}
+
+// publishWindow expone la medicion interna del controlador. Son las cifras
+// que el algoritmo usa para decidir, no las que ve un cliente: el RTT
+// arranca en la admision y el RPS excluye los rechazos, asi que difieren
+// de caddy_http_request_duration y de caddy_http_requests_total.
+//
+// El llamador (updateWindow) ya tiene c.mu tomado, asi que esta funcion no
+// puede volver a bloquear: sync.Mutex no es reentrante y hacerlo deja el
+// controlador deadlocked, con los waiters de acquire() sin despertar.
+func (c *adaptiveController) publishWindow(rps, averageRTTSec float64) {
+	m := reverseProxyMetrics
+	if m.adaptiveObservedRPS == nil || m.adaptiveAverageRTT == nil || m.adaptiveRPSStop == nil {
+		return
+	}
+	for _, upstream := range c.upstreams {
+		m.adaptiveObservedRPS.WithLabelValues(upstream).Set(rps)
+		m.adaptiveAverageRTT.WithLabelValues(upstream).Set(averageRTTSec)
+		m.adaptiveRPSStop.WithLabelValues(upstream).Set(c.rpsStop)
+	}
 }
 
 func calculateAverageRTT(totalRTT time.Duration, responseCount int64) (time.Duration, bool) {
@@ -272,6 +298,8 @@ func (c *adaptiveController) updateWindow(window time.Duration) {
 
 	// RTT en segundos.
 	currentRTTSec := averageRTT.Seconds()
+
+	c.publishWindow(currentRPS, currentRTTSec)
 
 	// ============================================================
 	// 2. Estimar concurrencia mediante Little's Law
@@ -474,8 +502,8 @@ func (c *adaptiveController) updateWindow(window time.Duration) {
 
 				// ----------------------------------------------------
 				// Tanda completa: recoveryRequired ventanas
-				// consecutivas. Deben superar la barra TODAS para
-				// aceptar el +1.
+				// consecutivas. Basta con que el RPS supere la barra
+				// en una de ellas.
 				// ----------------------------------------------------
 
 				ventanas := c.rpsSamples
@@ -493,23 +521,26 @@ func (c *adaptiveController) updateWindow(window time.Duration) {
 					}
 				}
 
-				if mejoradas == len(ventanas) {
-					// Todas las ventanas superaron el 10%: el +1 se
-					// queda y la referencia avanza al mayor RPS
-					// visto, que es más exigente que la anterior.
-					c.rpsStop = mayor
+				switch {
 
-				} else {
-					// Alguna ventana no superó la barra (aunque otra
-					// sí): el +1 no se sostuvo, se deshace y se
-					// vuelve al nivel del que partió la tanda.
+				case mejoradas == 0:
+					// Ninguna ventana superó el 10%: el +1 no
+					// sirvió, así que se deshace y se vuelve al
+					// nivel del que partió la tanda.
 					//
 					// rpsStop NO se toca. La referencia solo avanza
-					// cuando todas las ventanas la superan; si se
+					// cuando hay una ventana que la supera; si se
 					// bajara aquí al RPS actual, cada prueba
 					// fallida relajaría la barra y el ciclo sería
 					// un paseo aleatorio que nunca se estabiliza.
 					c.maxConn = c.rpsBatchMaxConn
+
+				default:
+					// Al menos una ventana superó la barra: el +1 se
+					// queda y la referencia avanza al mayor RPS que
+					// la superó, tanto si mejoraron todas las
+					// ventanas como si mejoró solo una.
+					c.rpsStop = mayor
 				}
 			}
 		}

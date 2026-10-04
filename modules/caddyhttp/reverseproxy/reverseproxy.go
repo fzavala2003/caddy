@@ -511,13 +511,12 @@ func (b *bodyNopCloserIfNotRead) Close() error {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	if h.adaptive != nil {
-		arrival := time.Now()
-		if !h.adaptive.acquire(r.Context()) {
-			h.adaptive.recordResponse(time.Since(arrival))
+		admitted, ok := h.adaptive.acquire(r.Context())
+		if !ok {
 			return caddyhttp.Error(http.StatusServiceUnavailable, r.Context().Err())
 		}
 		defer func() {
-			h.adaptive.recordResponse(time.Since(arrival))
+			h.adaptive.recordResponse(time.Since(admitted))
 			h.adaptive.release()
 		}()
 	}
