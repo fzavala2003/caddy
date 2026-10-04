@@ -267,8 +267,7 @@ func (c *adaptiveController) updateWindow(window time.Duration) {
 		return
 	}
 
-	// X:
-	// cantidad de respuestas observadas en la ventana.
+	// X: cantidad de respuestas observadas en la ventana.
 	currentX := float64(responseCount)
 
 	// RTT en segundos.
@@ -293,9 +292,7 @@ func (c *adaptiveController) updateWindow(window time.Duration) {
 	// 3. Primera ventana
 	//
 	// Todavía no podemos calcular elasticidad porque no existe
-	// una ventana anterior.
-	//
-	// Por eso hacemos el primer experimento:
+	// una ventana anterior. Por eso hacemos el primer experimento:
 	//
 	//     maxConn + 1
 	// ============================================================
@@ -311,8 +308,7 @@ func (c *adaptiveController) updateWindow(window time.Duration) {
 		if c.maxConn < c.maxConnCeiling {
 			c.maxConn++
 
-			// Registramos que esta ventana terminó
-			// con un aumento.
+			// Registramos que esta ventana terminó con un aumento.
 			c.lastMaxConnAction = +1
 		} else {
 			c.lastMaxConnAction = 0
@@ -349,42 +345,31 @@ func (c *adaptiveController) updateWindow(window time.Duration) {
 	previousL := c.previousConcurrency
 	previousRTT := c.previousRTT
 
-	// Esta variable nos dice si en la ventana anterior
-	// modificamos maxConn.
+	// Nos dice si en la ventana anterior modificamos maxConn.
 	previousAction := c.lastMaxConnAction
 
 	// ============================================================
-	// 5. Calcular variación de X
-	//
-	// ΔX/X
+	// 5. Calcular variación de X:  ΔX/X
 	// ============================================================
 
 	deltaX := 0.0
 
 	if previousX > 0 {
-		deltaX =
-			(currentX - previousX) /
-				previousX
+		deltaX = (currentX - previousX) / previousX
 	}
 
 	// ============================================================
-	// 6. Calcular variación de L
-	//
-	// ΔL/L
+	// 6. Calcular variación de L:  ΔL/L
 	// ============================================================
 
 	deltaL := 0.0
 
 	if previousL > 0 {
-		deltaL =
-			(currentL - previousL) /
-				previousL
+		deltaL = (currentL - previousL) / previousL
 	}
 
 	// ============================================================
-	// 7. Calcular elasticidad
-	//
-	// E = (ΔX/X) / (ΔL/L)
+	// 7. Calcular elasticidad:  E = (ΔX/X) / (ΔL/L)
 	// ============================================================
 
 	elasticity := 0.0
@@ -394,18 +379,9 @@ func (c *adaptiveController) updateWindow(window time.Duration) {
 		previousL > 0 &&
 		math.Abs(deltaL) >= adaptiveMinDeltaL {
 
-		// Evitamos el caso:
-		//
-		// ΔX < 0
-		// ΔL < 0
-		//
-		// porque matemáticamente:
-		//
-		// (-) / (-) = positivo
-		//
-		// pero eso NO significa que aumentar concurrencia
-		// sea beneficioso.
-
+		// Caso ΔX < 0 y ΔL < 0: matemáticamente (-)/(-) = positivo,
+		// pero eso NO significa que aumentar concurrencia sea
+		// beneficioso.
 		if deltaX < 0 && deltaL < 0 {
 			elasticity = 0
 		} else {
@@ -422,26 +398,19 @@ func (c *adaptiveController) updateWindow(window time.Duration) {
 	if previousAction == +1 {
 
 		// --------------------------------------------------------
-		// La ventana anterior fue un experimento:
-		//
-		// maxConn aumentó.
-		//
-		// Ahora evaluamos si ese aumento produjo una respuesta
-		// favorable.
+		// La ventana anterior fue un experimento: maxConn aumentó.
+		// Evaluamos si ese aumento produjo una respuesta favorable.
 		// --------------------------------------------------------
 
 		if hasElasticity && elasticity > 0 {
 
-			// El aumento fue beneficioso.
-			//
-			// Continuamos explorando capacidad.
-
+			// El aumento fue beneficioso: seguimos explorando.
 			if c.maxConn < c.maxConnCeiling {
 
 				c.maxConn++
 
-				// El nuevo aumento también deberá ser
-				// evaluado en la siguiente ventana.
+				// El nuevo aumento también se evalúa en la
+				// siguiente ventana.
 				c.lastMaxConnAction = +1
 
 			} else {
@@ -452,9 +421,8 @@ func (c *adaptiveController) updateWindow(window time.Duration) {
 		} else {
 
 			// ----------------------------------------------------
-			// El aumento dejó de ser beneficioso.
-			//
-			// Detenemos la expansión.
+			// El aumento dejó de ser beneficioso. Detenemos la
+			// expansión.
 			// ----------------------------------------------------
 
 			c.lastMaxConnAction = 0
@@ -471,31 +439,17 @@ func (c *adaptiveController) updateWindow(window time.Duration) {
 		// --------------------------------------------------------
 		// Estado de espera.
 		//
-		// Aquí NO utilizamos E para aumentar maxConn.
-		//
-		// La recuperación se mide con RPS, y aquí la espera no es
-		// pasiva. En congestión los RPS se estabilizan y no mejoran
-		// solos, así que esperar quieto no produciría nunca la
-		// evidencia que exigimos. En vez de eso, cada vez que el RPS
-		// mejora más del 10% sumamos +1 a propósito, y comprobamos
-		// si los RPS siguen subiendo: si suben, la mejora viene de
-		// la concurrencia; si se estancan, no.
+		// Aquí NO utilizamos E para aumentar maxConn. La
+		// recuperación se mide con RPS: en congestión los RPS se
+		// estabilizan y no mejoran solos, así que sumamos +1 a
+		// propósito y comprobamos si los RPS siguen subiendo.
 		// --------------------------------------------------------
 
 		if c.rpsStop > 0 {
 
-			// ----------------------------------------------------
 			// RPS mínimo necesario para considerar que hubo
-			// recuperación.
-			//
-			// Ejemplo:
-			//
-			// rpsStop = 1000 req/s
-			// threshold = 0.10
-			//
-			// recoveryLimit = 1100 req/s
-			// ----------------------------------------------------
-
+			// recuperación. Ejemplo: rpsStop = 1000 y
+			// threshold = 0.10 dan recoveryLimit = 1100 req/s.
 			recoveryLimit :=
 				c.rpsStop *
 					(1.0 + c.recoveryThreshold)
@@ -511,10 +465,7 @@ func (c *adaptiveController) updateWindow(window time.Duration) {
 			if len(c.rpsSamples) < c.recoveryRequired {
 
 				// Todavía no hay ventanas suficientes para decidir.
-				// Sumamos +1 a propósito y medimos la siguiente: en
-				// congestión los RPS se estabilizan y no mejoran
-				// solos, así que la mejora tiene que venir de más
-				// concurrencia.
+				// Sumamos +1 a propósito y medimos la siguiente.
 				if c.maxConn < c.maxConnCeiling {
 					c.maxConn++
 				}
@@ -523,8 +474,8 @@ func (c *adaptiveController) updateWindow(window time.Duration) {
 
 				// ----------------------------------------------------
 				// Tanda completa: recoveryRequired ventanas
-				// consecutivas. Basta con que el RPS supere la barra
-				// en una de ellas.
+				// consecutivas. Deben superar la barra TODAS para
+				// aceptar el +1.
 				// ----------------------------------------------------
 
 				ventanas := c.rpsSamples
@@ -542,30 +493,23 @@ func (c *adaptiveController) updateWindow(window time.Duration) {
 					}
 				}
 
-				switch {
+				if mejoradas == len(ventanas) {
+					// Todas las ventanas superaron el 10%: el +1 se
+					// queda y la referencia avanza al mayor RPS
+					// visto, que es más exigente que la anterior.
+					c.rpsStop = mayor
 
-				case mejoradas == 0:
-					// Ninguna ventana superó el 10%: el +1 no
-					// sirvió, así que se deshace y se vuelve al
-					// nivel del que partió la tanda.
+				} else {
+					// Alguna ventana no superó la barra (aunque otra
+					// sí): el +1 no se sostuvo, se deshace y se
+					// vuelve al nivel del que partió la tanda.
 					//
 					// rpsStop NO se toca. La referencia solo avanza
-					// cuando hay una ventana que la supera; si se
+					// cuando todas las ventanas la superan; si se
 					// bajara aquí al RPS actual, cada prueba
 					// fallida relajaría la barra y el ciclo sería
 					// un paseo aleatorio que nunca se estabiliza.
 					c.maxConn = c.rpsBatchMaxConn
-
-				case mejoradas == len(ventanas):
-					// Mejoraron todas: la referencia pasa a ser el
-					// mayor RPS visto, que es más exigente que la
-					// anterior.
-					c.rpsStop = mayor
-
-				default:
-					// Mejoró al menos una de las dos: el +1 está
-					// justificado. La referencia se mantiene y el
-					// ciclo vuelve a empezar con otro +1.
 				}
 			}
 		}
@@ -578,12 +522,9 @@ func (c *adaptiveController) updateWindow(window time.Duration) {
 	// ============================================================
 	// 9. Actualizar la ventana anterior
 	//
-	// IMPORTANTE:
-	//
 	// Aunque maxConn esté detenido, seguimos actualizando
-	// previousX, previousL y previousRTT.
-	//
-	// Por lo tanto, la comparación nunca se congela.
+	// previousX, previousL y previousRTT, así que la comparación
+	// nunca se congela.
 	// ============================================================
 
 	c.previousRequests = currentX
